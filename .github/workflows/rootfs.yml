@@ -312,14 +312,14 @@ jobs:
         run: |
           cd build
           patchelf --set-interpreter /data/data/com.winlator/files/rootfs/usr/lib/ld-linux-aarch64.so.1 ./box64
-          tar --zstd -cf box64-latest.tar.xz box64
+          tar --zstd -cf box64-latest.wcp box64
           
       - name: "Upload WCP file"
         if: matrix.platform == 'ANDROID_GLIBC' && matrix.type == 'Release'
         uses: actions/upload-artifact@v4
         with:
           name: box64-latest-${{ matrix.type }}-wcp
-          path: build/box64-latest.tar.xz
+          path: build/box64-latest.wcp
 
       - name: "Upload WowBox64 file"
         if: matrix.platform == 'WOW64' && matrix.type == 'Release'
