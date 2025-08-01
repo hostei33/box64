@@ -325,7 +325,7 @@ jobs:
             ]
           }
           EOF
-          patchelf --set-interpreter /data/data/com.winlator/files/imagefs/usr/lib/ld-linux-aarch64.so.1 ./box64
+          patchelf --set-interpreter /data/data/com.winlator/files/rootfs/usr/lib/ld-linux-aarch64.so.1 ./box64
           tar --zstd -cf box64-latest.wcp box64 profile.json
 
       - name: "Package Rat File for MiceWine"
