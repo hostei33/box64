@@ -70,8 +70,11 @@ pthread_mutex_t     mutex_blocks;
 #endif
 //#define TRACE_MEMSTAT
 rbtree_t* memprot = NULL;
-// fake guest 4k page permissions for non4k systems, used by getrlimit for example.
+// guest 4K page permissions for hosts with larger pages.
 static rbtree_t* memprot_guest = NULL;
+// guest 4K pages contain source code that the dynarec wants to write-protect
+static rbtree_t* memprot_guest_dyn = NULL;
+
 int have48bits = 0;
 static int inited = 0;
 typedef enum {
@@ -1404,6 +1407,15 @@ void* box32_dynarec_mmap(size_t size, int fd, off_t offset)
     return ret;
 }
 
+static int alignGuestPageRange(uintptr_t* addr, size_t size, uintptr_t* end)
+{
+    if (!size) return 0;
+    *end = *addr + size;
+    *addr &= ~(X86_PAGE_SIZE - 1);
+    *end = (*end + X86_PAGE_SIZE - 1) & ~(X86_PAGE_SIZE - 1);
+    return *end > *addr;
+}
+
 #ifdef DYNAREC
 typedef struct mmaplist_s {
     blocklist_t**   chunks;
@@ -2248,27 +2260,93 @@ uintptr_t getJumpAddress64(uintptr_t addr)
     #endif
 }
 
-// Helper: check if any sub-range in a host page has PROT_WRITE that is NOT part of the
-// dynarec-protected range [prot_start, prot_end). This detects mixed code+data host pages
-// on systems with large pages (e.g. 64KB) where mprotect to remove PROT_WRITE would also
-// strip writability from data regions, causing EFAULT on kernel writes (e.g. read() syscall).
-// Must be called with LOCK_PROT() held.
+static void setGuestDynProtection_locked(uintptr_t addr, size_t size)
+{
+    uintptr_t end;
+    if (box64_pagesize <= X86_PAGE_SIZE || !memprot_guest_dyn || !alignGuestPageRange(&addr, size, &end))
+        return;
+    rb_set(memprot_guest_dyn, addr, end, 1);
+}
+
+static void freeGuestDynProtection_locked(uintptr_t addr, size_t size)
+{
+    uintptr_t end;
+    if (box64_pagesize <= X86_PAGE_SIZE || !memprot_guest_dyn || !alignGuestPageRange(&addr, size, &end))
+        return;
+    rb_unset(memprot_guest_dyn, addr, end);
+}
+
+static int guestPageHasWrite_locked(uintptr_t guest_page)
+{
+    uintptr_t scan = guest_page;
+    uintptr_t guest_end = guest_page + X86_PAGE_SIZE;
+    while (scan < guest_end) {
+        uint32_t prot = 0;
+        uintptr_t bend = guest_end;
+        if (!memprot_guest || !rb_get_end(memprot_guest, scan, &prot, &bend)) {
+            prot = rb_get(memprot, scan) & ~PROT_CUSTOM;
+            if (!prot)
+                prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+        }
+        if (prot & PROT_WRITE)
+            return 1;
+        if (bend > guest_end)
+            bend = guest_end;
+        if (bend <= scan)
+            break;
+        scan = bend;
+    }
+    return 0;
+}
+
 static int hostPageHasExternalWrite_locked(uintptr_t host_page, uintptr_t prot_start, uintptr_t prot_end)
 {
-    uintptr_t scan = host_page;
     uintptr_t host_end = host_page + box64_pagesize;
-    while(scan < host_end) {
-        uint32_t p = 0;
-        uintptr_t bend = 0;
-        rb_get_end(memprot, scan, &p, &bend);
-        if(bend > host_end)
-            bend = host_end;
-        if(p && (p & PROT_WRITE) && !(p & PROT_DYN)) {
-            if(scan < prot_start || bend > prot_end) {
-                return 1;
-            }
-        }
-        scan = bend;
+    for (uintptr_t page = host_page; page < host_end; page += X86_PAGE_SIZE) {
+        if (!guestPageHasWrite_locked(page)) continue;
+        if (prot_end > prot_start && page < prot_end && page + X86_PAGE_SIZE > prot_start) continue;
+        if (memprot_guest_dyn && rb_get(memprot_guest_dyn, page)) continue;
+        return 1;
+    }
+    return 0;
+}
+
+// apply the real host-page protection implied by the current guest page
+// returns 1 if needs rebuild
+static int applyDBHostPageProtection_locked(uintptr_t cur, uintptr_t bend, uint32_t prot, uintptr_t prot_start, uintptr_t prot_end, int protect_requested)
+{
+    uint32_t old_prot = prot;
+    uint32_t dyn = prot & PROT_DYN;
+    uint32_t base_prot = prot & ~PROT_CUSTOM;
+    if (!prot) base_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+
+    if ((dyn & PROT_NOPROT) || ((dyn & PROT_NEVERCLEAN) && !(dyn & PROT_NEVERCLEAN_MIXED))) return 0;
+    if (!protect_requested && !dyn) return 0;
+    if (!base_prot) return 0;
+
+    int external_write = box64_pagesize > X86_PAGE_SIZE && hostPageHasExternalWrite_locked(cur & ~(box64_pagesize - 1), prot_start, prot_end);
+
+    if (external_write && (base_prot & PROT_WRITE)) {
+        if ((dyn & PROT_DYNAREC) && !(dyn & PROT_NEVERCLEAN))
+            mprotect((void*)cur, bend - cur, base_prot);
+        // a neighboring guest page needs write access
+        prot = base_prot | PROT_DYNAREC | PROT_NEVERCLEAN | PROT_NEVERCLEAN_MIXED;
+    } else if (base_prot & PROT_WRITE) {
+        if (!(dyn & PROT_DYNAREC) || (dyn & PROT_NEVERCLEAN_MIXED))
+            mprotect((void*)cur, bend - cur, base_prot & ~PROT_WRITE);
+        prot = base_prot | PROT_DYNAREC;
+    } else {
+        prot = base_prot | PROT_DYNAREC_R;
+    }
+
+    if (prot != old_prot)
+        rb_set(memprot, cur, bend, prot);
+
+    int old_mixed = (old_prot & PROT_NEVERCLEAN_MIXED) != 0;
+    int new_mixed = (prot & PROT_NEVERCLEAN_MIXED) != 0;
+    if (old_mixed != new_mixed) {
+        dynarec_log(LOG_INFO, "Dynarec host page %p switched to %s mode\n", (void*)(cur & ~(box64_pagesize - 1)), new_mixed ? "always_test" : "write-protected");
+        return 1;
     }
     return 0;
 }
@@ -2280,43 +2358,23 @@ void protectDBJumpTable(uintptr_t addr, size_t size, void* jump, void* ref)
 
     uintptr_t cur = addr&~(box64_pagesize-1);
     uintptr_t end = ALIGN(addr+size);
+    int rebuild = 0;
 
     LOCK_PROT();
+    setGuestDynProtection_locked(addr, size);
     while(cur!=end) {
-        uint32_t prot = 0, oprot;
+        uint32_t prot = 0;
         uintptr_t bend = 0;
         rb_get_end(memprot, cur, &prot, &bend);
         if(bend>end)
             bend = end;
-        oprot = prot;
-        uint32_t dyn = prot&PROT_DYN;
-        if(!prot)
-            prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-        if(!(dyn&PROT_NEVERPROT)) {
-            prot&=~PROT_CUSTOM;
-            if(prot&PROT_WRITE) {
-                if(!dyn) {
-                    if(box64_pagesize > 4096) {
-                        uintptr_t host_page = cur & ~(box64_pagesize-1);
-                        if(hostPageHasExternalWrite_locked(host_page, addr, addr+size)) {
-                            dynarec_log(LOG_INFO, "protectDBJumpTable: mixed code+data host page %p, using always_test instead of mprotect\n", (void*)host_page);
-                            prot |= PROT_NEVERCLEAN;
-                        } else {
-                            mprotect((void*)cur, bend-cur, prot&~PROT_WRITE);
-                        }
-                    } else {
-                        mprotect((void*)cur, bend-cur, prot&~PROT_WRITE);
-                    }
-                }
-                prot |= PROT_DYNAREC;
-            } else
-                prot |= PROT_DYNAREC_R;
+        if (applyDBHostPageProtection_locked(cur, bend, prot, addr, addr + size, 1)) {
+            rebuild = 1;
+            cleanDBFromAddressRange(cur, bend - cur, 2);
         }
-        if (prot != oprot) // If the node doesn't exist, then prot != 0
-            rb_set(memprot, cur, bend, prot);
         cur = bend;
     }
-    if(jump)
+    if (jump && !rebuild)
         setJumpTableIfRef64((void*)addr, jump, ref);
     UNLOCK_PROT();
 }
@@ -2330,43 +2388,15 @@ void protectDB(uintptr_t addr, uintptr_t size)
     uintptr_t end = ALIGN(addr+size);
 
     LOCK_PROT();
+    setGuestDynProtection_locked(addr, size);
     while(cur!=end) {
-        uint32_t prot = 0, oprot;
+        uint32_t prot = 0;
         uintptr_t bend = 0;
         rb_get_end(memprot, cur, &prot, &bend);
         if(bend>end)
             bend = end;
-        oprot = prot;
-        uint32_t dyn = prot&PROT_DYN;
-        if(!prot)
-            prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-        if(!(dyn&PROT_NEVERPROT)) {
-            prot&=~PROT_CUSTOM;
-            if(prot&PROT_WRITE) {
-                if(!dyn) {
-                    // On large-page systems, check if removing PROT_WRITE from this host page
-                    // would also affect writable data regions sharing the same host page.
-                    // If so, use PROT_NEVERCLEAN (always_test mode) instead of mprotect,
-                    // because kernel syscalls (e.g. read()) cannot be caught via SEGV and
-                    // would return EFAULT if the buffer is on a non-writable page.
-                    if(box64_pagesize > 4096) {
-                        uintptr_t host_page = cur & ~(box64_pagesize-1);
-                        if(hostPageHasExternalWrite_locked(host_page, addr, addr+size)) {
-                            dynarec_log(LOG_INFO, "protectDB: mixed code+data host page %p, using always_test instead of mprotect\n", (void*)host_page);
-                            prot |= PROT_NEVERCLEAN;
-                        } else {
-                            mprotect((void*)cur, bend-cur, prot&~PROT_WRITE);
-                        }
-                    } else {
-                        mprotect((void*)cur, bend-cur, prot&~PROT_WRITE);
-                    }
-                }
-                prot |= PROT_DYNAREC;
-            } else
-                prot |= PROT_DYNAREC_R;
-        }
-        if (prot != oprot) // If the node doesn't exist, then prot != 0
-            rb_set(memprot, cur, bend, prot);
+        if (applyDBHostPageProtection_locked(cur, bend, prot, addr, addr + size, 1))
+            cleanDBFromAddressRange(cur, bend - cur, 2);
         cur = bend;
     }
     UNLOCK_PROT();
@@ -2381,6 +2411,7 @@ void unprotectDB(uintptr_t addr, size_t size, int mark)
     uintptr_t end = ALIGN(addr+size);
 
     LOCK_PROT();
+    freeGuestDynProtection_locked(cur, end - cur);
     while(cur!=end) {
         uint32_t prot = 0, oprot;
         uintptr_t bend = 0;
@@ -2394,7 +2425,7 @@ void unprotectDB(uintptr_t addr, size_t size, int mark)
         oprot = prot;
         if(bend>end)
             bend = end;
-        if(!(prot&PROT_NEVERPROT)) {
+        if (!(prot & PROT_NEVERPROT) || (prot & PROT_NEVERCLEAN_MIXED)) {
             if(prot&PROT_DYNAREC) {
                 prot&=~PROT_DYN;
                 if(mark)
@@ -2421,6 +2452,7 @@ void neverprotectDB(uintptr_t addr, size_t size, int mark)
     uintptr_t end = ALIGN(addr+size);
 
     LOCK_PROT();
+    freeGuestDynProtection_locked(cur, end - cur);
     while(cur!=end) {
         uint32_t prot = 0, oprot;
         uintptr_t bend = 0;
@@ -2434,6 +2466,10 @@ void neverprotectDB(uintptr_t addr, size_t size, int mark)
         oprot = prot;
         if(bend>end)
             bend = end;
+        if (prot & PROT_NEVERCLEAN_MIXED) {
+            if (mark) cleanDBFromAddressRange(cur, bend - cur, (mark == 2) ? 2 : 0);
+            prot &= ~PROT_NEVERCLEAN_MIXED;
+        }
         if(!(prot&PROT_NEVERPROT)) {
             if(prot&PROT_DYNAREC) {
                 prot&=~PROT_DYN;
@@ -2589,6 +2625,26 @@ int checkInHotPage(uintptr_t addr)
     return ((idx==-1) || !hotpage[idx].cnt)?0:1;
 }
 
+static void updateDBHostProtectionForGuestRange(uintptr_t addr, size_t size)
+{
+    if (box64_pagesize <= X86_PAGE_SIZE || !size)
+        return;
+    uintptr_t cur = addr & ~(box64_pagesize - 1);
+    uintptr_t end = ALIGN(addr + size);
+    LOCK_PROT();
+    while (cur < end) {
+        uint32_t prot = 0;
+        uintptr_t bend = 0;
+        rb_get_end(memprot, cur, &prot, &bend);
+        if (bend > end)
+            bend = end;
+        if (applyDBHostPageProtection_locked(cur, bend, prot, 0, 0, 0))
+            cleanDBFromAddressRange(cur, bend - cur, 2);
+        cur = bend;
+    }
+    UNLOCK_PROT();
+}
+
 
 #endif
 
@@ -2612,7 +2668,7 @@ void updateProtection(uintptr_t addr, size_t size, uint32_t prot)
             cur = bend;
             continue;
         }
-        uint32_t never = dyn & PROT_NEVERCLEAN;
+        uint32_t never = dyn & (PROT_NEVERCLEAN | PROT_NEVERCLEAN_MIXED);
         #ifdef DYNAREC
         if(check && ((prot ^ oprot) & PROT_EXEC) && !never) { // prot_exec changed
             if(prot & PROT_EXEC) {
@@ -2810,30 +2866,33 @@ void freeProtection(uintptr_t addr, size_t size)
     LOCK_PROT();
     rb_unset(mapallmem, addr, addr+size);
     rb_unset(memprot, addr, addr+size);
+    if (memprot_guest_dyn)
+        rb_unset(memprot_guest_dyn, addr, addr + size);
     UNLOCK_PROT();
 }
 
-void setGuestFakeProtection(uintptr_t addr, size_t size, uint32_t prot)
+void setGuestProtection(uintptr_t addr, size_t size, uint32_t prot, int new_mapping)
 {
-    if(box64_pagesize <= X86_PAGE_SIZE || !memprot_guest || !size) return;
-    uintptr_t end = addr + size;
-    addr &= ~(X86_PAGE_SIZE - 1);
-    end = (end + X86_PAGE_SIZE - 1) & ~(X86_PAGE_SIZE - 1);
-    if(end <= addr) return;
+    uintptr_t end;
+    if (box64_pagesize <= X86_PAGE_SIZE || !memprot_guest || !alignGuestPageRange(&addr, size, &end)) return;
     LOCK_PROT();
     rb_set(memprot_guest, addr, end, prot & ~PROT_CUSTOM);
+    if ((new_mapping || !(prot & PROT_EXEC)) && memprot_guest_dyn)
+        rb_unset(memprot_guest_dyn, addr, end);
     UNLOCK_PROT();
+    #ifdef DYNAREC
+    if (BOX64ENV(dynarec)) updateDBHostProtectionForGuestRange(addr, end - addr);
+    #endif
 }
 
-void freeGuestFakeProtection(uintptr_t addr, size_t size)
+void freeGuestProtection(uintptr_t addr, size_t size)
 {
-    if(box64_pagesize <= X86_PAGE_SIZE || !memprot_guest || !size)return;
-    uintptr_t end = addr + size;
-    addr &= ~(X86_PAGE_SIZE - 1);
-    end = (end + X86_PAGE_SIZE - 1) & ~(X86_PAGE_SIZE - 1);
-    if(end <= addr) return;
+    uintptr_t end;
+    if (box64_pagesize <= X86_PAGE_SIZE || !memprot_guest || !alignGuestPageRange(&addr, size, &end)) return;
     LOCK_PROT();
     rb_unset(memprot_guest, addr, end);
+    if (memprot_guest_dyn)
+        rb_unset(memprot_guest_dyn, addr, end);
     UNLOCK_PROT();
 }
 
@@ -2911,33 +2970,19 @@ void* find31bitBlockNearHint(void* hint_, size_t size, uintptr_t mask)
 {
     // first, check if program break as changed
     catchup_brk_protection();
-    uint32_t prot;
     uintptr_t hint = (uintptr_t)hint_;
     if(hint_<LOWEST) hint = (uintptr_t)WINE_LOWEST;
-    uintptr_t bend = 0;
     uintptr_t cur = (uintptr_t)hint;
     uintptr_t upper = 0xc0000000LL;
     if(cur>upper) upper = 0x100000000LL;
     if(!mask) mask = 0xffff;
-    while(cur<upper) {
-        if(!rb_get_end(mapallmem, cur, &prot, &bend)) {
-            if(bend-cur>=size)
-                return (void*)cur;
-        }
-        // granularity 0x10000
-        cur = (bend+mask)&~mask;
-    }
+    if(rb_find_free_range(mapallmem, cur, upper, size, mask, &cur))
+        return (void*)cur;
     if(hint_)
         return NULL;
     cur = (uintptr_t)LOWEST;
-    while(cur<(uintptr_t)hint) {
-        if(!rb_get_end(mapallmem, cur, &prot, &bend)) {
-            if(bend-cur>=size)
-                return (void*)cur;
-        }
-        // granularity 0x10000
-        cur = (bend+mask)&~mask;
-    }
+    if(rb_find_free_range(mapallmem, cur, hint, size, mask, &cur))
+        return (void*)cur;
     return NULL;
 }
 
@@ -2962,19 +3007,11 @@ void* find47bitBlockNearHint(void* hint, size_t size, uintptr_t mask)
 {
     // first, check if program break as changed
     catchup_brk_protection();
-    uint32_t prot;
     if(hint<LOWEST) hint = LOWEST;
-    uintptr_t bend = 0;
     uintptr_t cur = (uintptr_t)hint;
     if(!mask) mask = 0xffff;
-    while(bend<0x800000000000LL) {
-        if(!rb_get_end(mapallmem, cur, &prot, &bend)) {
-            if(bend-cur>=size)
-                return (void*)cur;
-        }
-        // granularity 0x10000
-        cur = (bend+mask)&~mask;
-    }
+    if(rb_find_free_range(mapallmem, cur, 0x800000000000LL, size, mask, &cur))
+        return (void*)cur;
     return NULL;
 }
 void* find47bitBlockElf(size_t size, int mainbin, uintptr_t mask)
@@ -3163,6 +3200,7 @@ void init_custommem_helper(box64context_t* ctx)
             rb_set(blockstree, (uintptr_t)p_blocks[i].block, (uintptr_t)p_blocks[i].block+p_blocks[i].size, i);
     memprot = rbtree_init("memprot");
     memprot_guest = rbtree_init("memprot_guest");
+    memprot_guest_dyn = rbtree_init("memprot_guest_dyn");
 #ifdef DYNAREC
     #ifdef JMPTABL_SHIFT4
     for(int i=0; i<(1<<JMPTABL_SHIFT3); ++i) {
@@ -3269,6 +3307,8 @@ void fini_custommem_helper(box64context_t *ctx)
     memprot = NULL;
     rbtree_delete(memprot_guest);
     memprot_guest = NULL;
+    rbtree_delete(memprot_guest_dyn);
+    memprot_guest_dyn = NULL;
     rbtree_delete(mapallmem);
     mapallmem = NULL;
     rbtree_delete(blockstree);
@@ -3330,28 +3370,41 @@ void getLockAddressRange(uintptr_t start, size_t size, uintptr_t addrs[])
 #ifndef MAP_32BIT
 #define MAP_32BIT 0x40
 #endif
+
+#ifndef NOALIGN
+#define BOX64_MMAP47_LIMIT (1ULL << 47)
+
+static int fits47Bits(void* addr, size_t length)
+{
+    return (uintptr_t)addr < BOX64_MMAP47_LIMIT && length <= BOX64_MMAP47_LIMIT - (uintptr_t)addr;
+}
+
+static int needsWine64KBAlignment(void* addr)
+{
+    return box64_wine && box64_pagesize == X86_PAGE_SIZE && ((uintptr_t)addr & 0xffff);
+}
+#endif
 EXPORT void* box_mmap(void *addr, size_t length, int prot, int flags, int fd, ssize_t offset)
 {
     if(prot&PROT_WRITE)
         prot|=PROT_READ;    // PROT_READ is implicit with PROT_WRITE on i386
     int new_flags = flags;
     void* old_addr = addr;
+    int check_47bit = 0;
     #ifndef NOALIGN
     new_flags&=~MAP_32BIT;   // remove MAP_32BIT
     if((flags&MAP_32BIT) && !(flags&MAP_FIXED)) {
         // MAP_32BIT only exist on x86_64!
         addr = find31bitBlockNearHint(old_addr, length, 0);
-    } else if (box64_wine || 1) {   // other mmap should be restricted to 47bits
-        if (!(flags&MAP_FIXED) && !addr)
-            addr = find47bitBlock(length);
-    }
+    } else if (!(flags & MAP_FIXED) && !addr)
+        check_47bit = 1;
     #endif
     void* ret = InternalMmap(addr, length, prot, new_flags, fd, offset);
     // io_uring doesn't support non-NULL address.
     // The optimal approach is to detect whether an fd is an io_uring instance,
     // but this is overly complex. So we simply retry the mmap call with the
     // original address here.
-    if (ret == MAP_FAILED && old_addr == NULL && fd >= 0)
+    if (ret == MAP_FAILED && old_addr == NULL && fd >= 0 && addr != old_addr)
         ret = InternalMmap(old_addr, length, prot, new_flags, fd, offset);
     #if !defined(NOALIGN)
     if((ret!=MAP_FAILED) && (flags&MAP_32BIT) &&
@@ -3365,8 +3418,29 @@ EXPORT void* box_mmap(void *addr, size_t length, int prot, int flags, int fd, ss
         ret = InternalMmap(addr, length, prot, new_flags, fd, offset);
         if(old_addr && ret!=old_addr && ret!=MAP_FAILED)
             errno = olderr;
-    } else if((ret!=MAP_FAILED) && !(flags&MAP_FIXED) && ((box64_wine)) && (addr && (addr!=ret)) &&
-             (((uintptr_t)ret>0x7fffffffffffLL) || (box64_pagesize == X86_PAGE_SIZE && ((uintptr_t)ret&0xffff)))) {
+    } else if ((ret != MAP_FAILED) && check_47bit && (!fits47Bits(ret, length) || needsWine64KBAlignment(ret))) {
+        int olderr = errno;
+        InternalMunmap(ret, length);
+        loadProtectionFromMap(); // reload map, because something went wrong previously
+        addr = find47bitBlock(length);
+        if (addr && isBlockFree(addr, length)) {
+            new_flags |= MAP_FIXED;
+            if ((new_flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == (MAP_FIXED | MAP_FIXED_NOREPLACE))
+                new_flags &= ~MAP_FIXED_NOREPLACE;
+            ret = InternalMmap(addr, length, prot, new_flags, fd, offset);
+            if (ret != MAP_FAILED && (!fits47Bits(ret, length) || needsWine64KBAlignment(ret))) {
+                InternalMunmap(ret, length);
+                ret = MAP_FAILED;
+                errno = ENOMEM;
+            }
+        } else {
+            ret = MAP_FAILED;
+            errno = ENOMEM;
+        }
+        if (old_addr && ret != old_addr && ret != MAP_FAILED)
+            errno = olderr;
+    } else if ((ret != MAP_FAILED) && !(flags & MAP_FIXED) && ((box64_wine)) && (addr && (addr != ret))
+        && (((uintptr_t)ret > 0x7fffffffffffLL) || (box64_pagesize == X86_PAGE_SIZE && ((uintptr_t)ret & 0xffff)))) {
         int olderr = errno;
         InternalMunmap(ret, length);
         loadProtectionFromMap();    // reload map, because something went wrong previously

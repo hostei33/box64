@@ -199,6 +199,7 @@
 #() cFpi
 #() cFpp
 #() wFpi
+#() wFpp
 #() iFEi
 #() iFEu
 #() iFEp
@@ -543,6 +544,7 @@
 #() vFpLL
 #() vFpLp
 #() vFppi
+#() vFppC
 #() vFppu
 #() vFppU
 #() vFppf
@@ -661,6 +663,7 @@
 #() iFpfu
 #() iFpff
 #() iFpdd
+#() iFpdp
 #() iFpli
 #() iFpll
 #() iFplL
@@ -1174,6 +1177,7 @@
 #() iFEupp
 #() iFEpii
 #() iFEpip
+#() iFEpiV
 #() iFEpui
 #() iFEpup
 #() iFEpuV
@@ -1240,6 +1244,8 @@
 #() iFuppi
 #() iFuppu
 #() iFuppp
+#() iFllpp
+#() iFlpup
 #() iFLpLp
 #() iFLppp
 #() iFpcLp
@@ -1587,6 +1593,7 @@
 #() pFEppA
 #() pFiiii
 #() pFiiiu
+#() pFiiip
 #() pFiiuu
 #() pFiiup
 #() pFiiLp
@@ -1625,6 +1632,7 @@
 #() pFpiiU
 #() pFpiip
 #() pFpiuu
+#() pFpiup
 #() pFpiUL
 #() pFpiLi
 #() pFpiLu
@@ -1988,6 +1996,7 @@
 #() iFpiiip
 #() iFpiiui
 #() iFpiiuu
+#() iFpiiup
 #() iFpiipi
 #() iFpiipp
 #() iFpiuwp
@@ -2300,6 +2309,7 @@
 #() pFpiiii
 #() pFpiiip
 #() pFpiiuu
+#() pFpiiup
 #() pFpiipi
 #() pFpiipp
 #() pFpiCCC
@@ -2705,6 +2715,7 @@
 #() iFppuipp
 #() iFppuIII
 #() iFppuIup
+#() iFppuuup
 #() iFppuuLp
 #() iFppuupL
 #() iFppuupp
@@ -2876,6 +2887,7 @@
 #() pFEppppp
 #() pFiiiiii
 #() pFiiiiid
+#() pFiiiipp
 #() pFipippp
 #() pFWCiWCi
 #() pFuCCCCp
@@ -2932,6 +2944,7 @@
 #() pFppipip
 #() pFppippi
 #() pFppippp
+#() pFppuiip
 #() pFppuuuu
 #() pFppuupp
 #() pFppuLli
@@ -3132,9 +3145,13 @@
 #() iFuuppppp
 #() iFupupppu
 #() iFpiiiiii
+#() iFpiiiiup
+#() iFpiiiipi
 #() iFpiiiuwp
 #() iFpiiifff
+#() iFpiiippi
 #() iFpiiCCCC
+#() iFpiiuiip
 #() iFpiiffff
 #() iFpiipiii
 #() iFpiipppp
@@ -3284,6 +3301,8 @@
 #() pFEppppip
 #() pFEpppppi
 #() pFEpppppp
+#() pFiiiipip
+#() pFiiippip
 #() pFifffppp
 #() pFWpppppp
 #() pFuuuiiip
@@ -3465,12 +3484,14 @@
 #() iFupipppip
 #() iFdiippppL
 #() iFpiiiiiiu
+#() iFpiiipppi
 #() iFpiiupppp
 #() iFpiuiiLLL
 #() iFpipiipip
 #() iFpippiiii
 #() iFpippuuui
 #() iFpippuupp
+#() iFpipppppp
 #() iFpCCWWpWu
 #() iFpWCuWCuu
 #() iFpuiiipip
@@ -3575,6 +3596,7 @@
 #() pFEpppppiV
 #() pFEppppppi
 #() pFEppppppp
+#() pFiiipppip
 #() pFiippipip
 #() pFiupppppp
 #() pFuiiiuuuu
@@ -3597,6 +3619,7 @@
 #() pFpLppLLiL
 #() pFppiiiiii
 #() pFpppipipi
+#() pFpppuuiip
 #() pFppplippp
 #() pFppppuppp
 #() pFpppppiip
@@ -3769,13 +3792,16 @@
 #() pFEpppppppp
 #() pFuupuuuuuu
 #() pFpiiiiuuuu
+#() pFpiiiiuuup
 #() pFpiiuuuuii
+#() pFpupupupui
 #() pFpLpLLipui
 #() pFpLppLLiLi
 #() pFppupupuuu
 #() pFppupppppp
 #() pFpppiiiiii
 #() pFpppuipppp
+#() pFpppuuiiip
 #() pFpppppuupp
 #() iWEpuuiippu
 #() iWEpuuuiipp
@@ -4497,6 +4523,8 @@ wrappeddbus:
   - dbus_connection_set_unix_user_function
   - dbus_connection_set_wakeup_main_function
   - dbus_server_set_new_connection_function
+- vFpppV:
+  - dbus_set_error
 - uFpipp:
   - dbus_connection_set_data
   - dbus_message_set_data
@@ -4965,6 +4993,8 @@ wrappedgnutls:
   - gnutls_global_set_log_function
 - vFpp:
   - gnutls_certificate_set_retrieve_function
+  - gnutls_certificate_set_verify_function
+  - gnutls_session_set_verify_function
   - gnutls_transport_set_pull_function
   - gnutls_transport_set_pull_timeout_function
   - gnutls_transport_set_push_function
@@ -5231,6 +5261,8 @@ wrappedgtk3:
   - gtk_style_context_get_style_valist
 - iFpp:
   - gtk_init_check
+- uFpp:
+  - gtk_key_snooper_install
 - pFiV:
   - gtk_tree_store_new
 - vFpuV:
@@ -6286,6 +6318,14 @@ wrappedlibomp:
   - GOMP_parallel
 - vFppplliupi:
   - GOMP_task
+wrappedlibopus:
+- iFpiV:
+  - opus_decoder_ctl
+  - opus_encoder_ctl
+  - opus_multistream_decoder_ctl
+  - opus_multistream_encoder_ctl
+  - opus_projection_decoder_ctl
+  - opus_projection_encoder_ctl
 wrappedlibpanel:
 wrappedlibpci:
 wrappedlibpcre:
@@ -6349,6 +6389,7 @@ wrappedlibpthread:
   - pthread_mutexattr_setprotocol
   - pthread_mutexattr_setpshared
   - pthread_mutexattr_setrobust
+  - pthread_mutexattr_setrobust_np
   - pthread_mutexattr_settype
 - iFpL:
   - pthread_attr_setguardsize
@@ -6836,6 +6877,7 @@ wrappednss3:
 - vFp:
   - PK11_SetPasswordFunc
   - PORT_SetUCS2_ASCIIConversionFunction
+  - PORT_SetUCS2_UTF8ConversionFunction
 - iFpp:
   - CERT_RegisterAlternateOCSPAIAInfoCallBack
   - NSS_RegisterShutdown
